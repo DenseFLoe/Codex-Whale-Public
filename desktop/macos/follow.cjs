@@ -14,16 +14,30 @@ function companionBounds(bounds) {
 
 function createMacFollower({ window, native, getMode, applyHost, getHost, onError = () => {}, now = Date.now }) {
   let latest = null, attached = null, lastAt = 0, lastBounds = '', lastError = '';
+  let uncertainSince = null, lastOrderingError = '';
   let disposed = false, inTick = false;
   const status = { mode: 'macos-space-bound', bound: false, animating: false, reason: null, spaces: [] };
   const identity = host => String(host?.hostPid || '') + ':' + String(host?.window || '');
   function failed(reason) {
     status.bound = false; status.animating = false; status.reason = reason; status.spaces = [];
+    delete status.transientReason; delete status.orderingError;
     delete status.hostWindow; delete status.overlayWindow;
     delete status.hostBounds; delete status.overlayBounds;
     if (reason !== lastError) { lastError = reason; onError(reason); }
-    attached = null; lastBounds = '';
+    attached = null; lastBounds = ''; uncertainSince = null; lastOrderingError = '';
     applyHost({ ...(latest || {}), visible: false, attached: false, nativeFollowing: false, followMode: status.mode });
+  }
+  function deferHostReadFailure(reason, target) {
+    // A single failed WindowServer state read does not revoke a binding that
+    // was just verified for this exact host. Keep the existing window and its
+    // input surface through a short gap; a persistent failure still hides it.
+    if (reason !== 'host-state-unavailable' || !status.bound || !attached || identity(attached) !== identity(target)) return false;
+    const time = now();
+    if (uncertainSince === null) uncertainSince = time;
+    if (time - uncertainSince >= 250) return false;
+    if (status.transientReason !== reason) onError('transient-' + reason);
+    status.transientReason = reason;
+    return true;
   }
   function tick() {
     if (disposed || inTick || getMode() !== 'follow-codex' || !latest || window.isDestroyed()) return;
@@ -42,7 +56,11 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
       }
       const sample = JSON.parse(native.sync(window.getNativeWindowHandle(), hostWindow, hostPid));
       status.native = sample;
-      if (!sample.ok) { failed(sample.reason || 'space-binding-failed'); return; }
+      if (!sample.ok) {
+        const reason = sample.reason || 'space-binding-failed';
+        if (deferHostReadFailure(reason, target)) return;
+        failed(reason); return;
+      }
       status.animating = !!sample.animating;
       if (sample.animating) return;
       if (!sample.bound) { failed('space-bind-unverified'); return; }
@@ -60,20 +78,33 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
       status.bound = true; status.reason = null; status.spaces = sample.spaces || [];
       status.hostWindow = sample.hostWindow; status.overlayWindow = sample.overlayWindow;
       status.hostBounds = hostRect; status.overlayBounds = rect;
-      lastError = '';
+      lastError = ''; uncertainSince = null; delete status.transientReason;
       // Ignore the probe's on-screen flag. Membership itself prevents painting
       // on another Space; hiding here would make the return animation pop in.
       applyHost(attached);
       // showInactive/focus and host activation can reorder normal-level
       // windows. Stay immediately above the verified host, below windows
       // covering it. Never order a hidden companion in or disturb a Space swipe.
-      if (attached.visible && window.isVisible()) window.moveAbove(`window:${hostWindow}:0`);
+      if (attached.visible && window.isVisible()) {
+        try {
+          window.moveAbove(`window:${hostWindow}:0`);
+          lastOrderingError = ''; delete status.orderingError;
+        } catch {
+          // Ordering is separate from the verified Space membership. Retry on
+          // the next tick without hiding a healthy, clickable companion.
+          status.orderingError = 'relative-order-failed';
+          if (lastOrderingError !== status.orderingError) onError(status.orderingError);
+          lastOrderingError = status.orderingError;
+        }
+      }
     } catch { failed('native-space-sync-failed'); }
     finally { inTick = false; }
   }
   function observe(host) { latest = host; lastAt = now(); tick(); }
   function reset() {
     attached = null; lastBounds = ''; status.bound = false; status.animating = false; status.spaces = []; status.reason = null;
+    uncertainSince = null; lastOrderingError = ''; lastError = '';
+    delete status.transientReason; delete status.orderingError;
     delete status.hostWindow; delete status.overlayWindow;
     delete status.hostBounds; delete status.overlayBounds;
     // A fresh probe update will select the current window after a mode switch.

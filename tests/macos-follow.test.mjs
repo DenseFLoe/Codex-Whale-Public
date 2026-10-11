@@ -90,12 +90,56 @@ test('a replacement host is hidden before retargeting and uses the new window ID
   assert.deepEqual(f.calls.at(-1), ['above', 'window:456:0']);
 });
 
-test('ordering failure hides the companion and a fresh valid sample can recover', () => {
-  const f = fixture(); f.setOrderFailure(true); f.follower.observe(f.host);
+test('brief host state read failure keeps the verified companion visible', () => {
+  const f = fixture(); f.follower.observe(f.host); f.calls.length = 0;
+  f.patch({ ok: false, reason: 'host-state-unavailable' });
+  f.follower.tick(); f.setTime(249); f.follower.tick();
+  assert.equal(f.window.isVisible(), true);
+  assert.equal(f.follower.snapshot().bound, true);
+  assert.equal(f.follower.snapshot().transientReason, 'host-state-unavailable');
+  assert.equal(f.calls.some(call => call[0] === 'hide' || call[0] === 'apply'), false);
+  f.patch({ ok: true }); f.follower.tick();
+  assert.equal(f.follower.snapshot().transientReason, undefined);
+  assert.equal(f.calls.some(call => call[0] === 'hide'), false);
+});
+
+test('persistent host state failure and a different host still fail closed', () => {
+  const f = fixture(); f.follower.observe(f.host); f.calls.length = 0;
+  f.patch({ ok: false, reason: 'host-state-unavailable' });
+  f.follower.tick(); f.setTime(250); f.follower.tick();
   assert.equal(f.window.isVisible(), false);
   assert.equal(f.follower.snapshot().bound, false);
+  f.patch({ ok: true }); f.follower.tick();
+  assert.equal(f.window.isVisible(), true);
+  f.calls.length = 0;
+  f.patch({ ok: false, reason: 'host-state-unavailable' });
+  f.follower.observe({ ...f.host, window: '456' });
+  assert.equal(f.window.isVisible(), false);
+  assert.equal(f.follower.snapshot().bound, false);
+});
+
+test('confirmed host hide and host-window loss bypass the transient grace period', () => {
+  const f = fixture(); f.follower.observe(f.host); f.calls.length = 0;
+  f.patch({ visible: false }); f.follower.tick();
+  assert.equal(f.window.isVisible(), false);
+  f.patch({ visible: true }); f.follower.tick();
+  assert.equal(f.window.isVisible(), true);
+  f.patch({ ok: false, reason: 'host-state-unavailable' }); f.follower.tick();
+  assert.equal(f.window.isVisible(), true);
+  f.patch({ reason: 'host-window-gone' }); f.follower.tick();
+  assert.equal(f.window.isVisible(), false);
+  assert.equal(f.follower.snapshot().bound, false);
+});
+
+test('ordering failure keeps a verified binding and retries without remapping', () => {
+  const f = fixture(); f.setOrderFailure(true); f.follower.observe(f.host);
+  assert.equal(f.window.isVisible(), true);
+  assert.equal(f.follower.snapshot().bound, true);
+  assert.equal(f.follower.snapshot().orderingError, 'relative-order-failed');
   f.setOrderFailure(false); f.calls.length = 0; f.follower.tick();
   assert.equal(f.window.isVisible(), true);
   assert.equal(f.follower.snapshot().bound, true);
+  assert.equal(f.follower.snapshot().orderingError, undefined);
+  assert.equal(f.calls.some(call => call[0] === 'hide'), false);
   assert.deepEqual(f.calls.at(-1), ['above', 'window:123:0']);
 });
