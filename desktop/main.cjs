@@ -11,7 +11,7 @@ const { validateWindowShape, EMPTY_SHAPE } = require('./window-shape.cjs');
 const { createVisibilityController } = require('./visibility.cjs');
 const { createVisibilityRecorder } = require('./visibility-recorder.cjs');
 const { createSurfaceGuard } = require('./surface-guard.cjs');
-const { createMacFollower } = require('./macos/follow.cjs');
+const { createMacFollower, companionBounds } = require('./macos/follow.cjs');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const root = path.resolve(__dirname, '..');
@@ -256,7 +256,7 @@ async function setHost(host) {
   if (modePending) {
     if (host.mode !== desktopMode || (desktopMode === 'standalone' ? host.nativeFollowing || host.attached : host.hostAlive && !host.attached)) return;
     modePending = false;
-    window.setAlwaysOnTop(desktopMode === 'standalone' || isMac, 'floating');
+    window.setAlwaysOnTop(desktopMode === 'standalone', 'floating');
     window.webContents.send('whale-desktop-mode', desktopMode);
     updateTray();
   } else if (!isMac && !fixture && host.mode && host.mode !== desktopMode) return;
@@ -317,8 +317,9 @@ else {
       return new Response(request.method === 'HEAD' ? null : result.body, { status: result.status, headers: result.headers });
     });
     const firstBounds = initialHost?.bounds;
-    const area = firstBounds && ['x','y','width','height'].every(k => Number.isFinite(firstBounds[k])) && firstBounds.width > 10 && firstBounds.height > 10
+    const hostArea = firstBounds && ['x','y','width','height'].every(k => Number.isFinite(firstBounds[k])) && firstBounds.width > 10 && firstBounds.height > 10
       ? toDipRect(firstBounds) : screen.getPrimaryDisplay().workArea;
+    const area = isMac && desktopMode === 'follow-codex' ? companionBounds(hostArea) : hostArea;
     // WS_EX_TOOLWINDOW keeps the large transparent overlay out of Chromium's
     // native occlusion calculation even while its opaque pixels accept clicks.
     // Keep normal activation: Chromium's non-client handler consumes the first
@@ -339,7 +340,9 @@ else {
         macFollowTimer = setInterval(() => macFollower.tick(), 16);
       }
     }
-    window.setAlwaysOnTop(isMac || desktopMode === 'standalone', 'floating');
+    // Follow windows share Codex's normal level; the macOS follower maintains
+    // relative ordering so another application's window can cover both.
+    window.setAlwaysOnTop(desktopMode === 'standalone', 'floating');
     if (desktopMode === 'standalone') window.setBounds(screen.getPrimaryDisplay().workArea);
     window.webContents.on('render-process-gone', (_event, details) => { rendererReady = false; if (usesSurfaceGuard) surfaceGuard.fail('renderer-gone'); visibility(); recoverRenderer('renderer-' + details.reason); });
     window.on('unresponsive', () => {
@@ -516,7 +519,7 @@ function setMode(mode) {
     modePending = true; manuallyHidden = false; visibility(); return true;
   }
   if (mode === 'standalone') { window.setBounds(screen.getPrimaryDisplay().workArea); window.setAlwaysOnTop(true, 'floating'); }
-  else { window.setAlwaysOnTop(isMac, 'floating'); if (lastHost) void setHost({ ...lastHost, serial: undefined }); }
+  else { window.setAlwaysOnTop(false, 'floating'); if (lastHost) void setHost({ ...lastHost, serial: undefined }); }
   window.webContents.send('whale-desktop-mode', mode); show(); updateTray(); return true;
 }
 function updateTray() {

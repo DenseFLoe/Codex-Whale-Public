@@ -1,6 +1,17 @@
 // Spaces are a compositor transform, not a window move. Bind the companion to
 // the host's Spaces, keep it ordered in while the host is on another Space, and
 // use fresh model bounds only while the compositor is settled.
+function companionBounds(bounds) {
+  // macOS 27 / Electron 44 can omit the host from a Space thumbnail when this
+  // transparent window has exactly the host's frame. Real A/B testing isolated
+  // the frame, not alpha, zoom, level or recurring ordering (see the thumbnail
+  // investigation). Reserve the smallest integer-point strip at the right
+  // edge. Keep the origin, height and renderer scale; never accumulate insets
+  // from the companion's previous bounds or use Mission Control transforms.
+  return { x: Math.round(bounds.x), y: Math.round(bounds.y),
+    width: Math.max(1, Math.round(bounds.width) - 1), height: Math.round(bounds.height) };
+}
+
 function createMacFollower({ window, native, getMode, applyHost, getHost, onError = () => {}, now = Date.now }) {
   let latest = null, attached = null, lastAt = 0, lastBounds = '', lastError = '';
   let disposed = false, inTick = false;
@@ -9,6 +20,7 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
   function failed(reason) {
     status.bound = false; status.animating = false; status.reason = reason; status.spaces = [];
     delete status.hostWindow; delete status.overlayWindow;
+    delete status.hostBounds; delete status.overlayBounds;
     if (reason !== lastError) { lastError = reason; onError(reason); }
     attached = null; lastBounds = '';
     applyHost({ ...(latest || {}), visible: false, attached: false, nativeFollowing: false, followMode: status.mode });
@@ -38,18 +50,24 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
       if (!bounds || !['x', 'y', 'width', 'height'].every(key => Number.isFinite(bounds[key]))
           || bounds.width <= 10 || bounds.height <= 10) { failed('invalid-host-bounds'); return; }
       // macOS model bounds are already points. Do not use the Windows DPI path.
-      const rect = Object.fromEntries(Object.entries(bounds).map(([key, value]) => [key, Math.round(value)]));
+      const hostRect = Object.fromEntries(Object.entries(bounds).map(([key, value]) => [key, Math.round(value)]));
+      const rect = companionBounds(bounds);
       const key = JSON.stringify(rect);
       if (identity(attached) !== identity(target) && window.isVisible()) window.hide();
       if (key !== lastBounds) { window.setBounds(rect, false); lastBounds = key; }
       attached = { ...target, hostAlive: true, visible: !!sample.visible, attached: true,
-        nativeFollowing: false, followMode: status.mode, bounds: rect };
+        nativeFollowing: false, followMode: status.mode, bounds: hostRect };
       status.bound = true; status.reason = null; status.spaces = sample.spaces || [];
       status.hostWindow = sample.hostWindow; status.overlayWindow = sample.overlayWindow;
+      status.hostBounds = hostRect; status.overlayBounds = rect;
       lastError = '';
       // Ignore the probe's on-screen flag. Membership itself prevents painting
       // on another Space; hiding here would make the return animation pop in.
       applyHost(attached);
+      // showInactive/focus and host activation can reorder normal-level
+      // windows. Stay immediately above the verified host, below windows
+      // covering it. Never order a hidden companion in or disturb a Space swipe.
+      if (attached.visible && window.isVisible()) window.moveAbove(`window:${hostWindow}:0`);
     } catch { failed('native-space-sync-failed'); }
     finally { inTick = false; }
   }
@@ -57,9 +75,10 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
   function reset() {
     attached = null; lastBounds = ''; status.bound = false; status.animating = false; status.spaces = []; status.reason = null;
     delete status.hostWindow; delete status.overlayWindow;
+    delete status.hostBounds; delete status.overlayBounds;
     // A fresh probe update will select the current window after a mode switch.
     latest = getHost(); lastAt = now();
   }
   return { observe, tick, reset, snapshot: () => ({ ...status }), dispose() { disposed = true; attached = null; } };
 }
-module.exports = { createMacFollower };
+module.exports = { createMacFollower, companionBounds };
