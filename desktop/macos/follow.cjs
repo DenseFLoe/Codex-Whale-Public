@@ -12,7 +12,7 @@ function companionBounds(bounds) {
     width: Math.max(1, Math.round(bounds.width) - 1), height: Math.round(bounds.height) };
 }
 
-function createMacFollower({ window, native, getMode, applyHost, getHost, isVisible = () => window.isVisible(), onError = () => {}, now = Date.now }) {
+function createMacFollower({ window, native, getMode, applyHost, getHost, isVisible = () => window.isVisible(), getOverlayBounds = companionBounds, onError = () => {}, now = Date.now }) {
   let latest = null, attached = null, lastAt = 0, lastBounds = '', lastError = '';
   let uncertainSince = null, lastOrderingError = '';
   let foregroundLevel = null;
@@ -70,7 +70,9 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, isVisi
           || bounds.width <= 10 || bounds.height <= 10) { failed('invalid-host-bounds'); return; }
       // macOS model bounds are already points. Do not use the Windows DPI path.
       const hostRect = Object.fromEntries(Object.entries(bounds).map(([key, value]) => [key, Math.round(value)]));
-      const rect = companionBounds(bounds);
+      const rect = getOverlayBounds(hostRect, target);
+      if (!rect || !['x', 'y', 'width', 'height'].every(key => Number.isSafeInteger(rect[key]))
+          || rect.width <= 0 || rect.height <= 0) { failed('invalid-overlay-bounds'); return; }
       const key = JSON.stringify(rect);
       if (identity(attached) !== identity(target) && isVisible()) window.hide();
       if (key !== lastBounds) { window.setBounds(rect, false); lastBounds = key; }

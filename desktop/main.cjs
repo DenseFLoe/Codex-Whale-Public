@@ -11,7 +11,8 @@ const { validateWindowShape, EMPTY_SHAPE } = require('./window-shape.cjs');
 const { createVisibilityController } = require('./visibility.cjs');
 const { createVisibilityRecorder } = require('./visibility-recorder.cjs');
 const { createSurfaceGuard } = require('./surface-guard.cjs');
-const { createMacFollower, companionBounds } = require('./macos/follow.cjs');
+const { createMacFollower } = require('./macos/follow.cjs');
+const { compactBounds, validLayout } = require('./macos/compact-window.cjs');
 const { randomUUID } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const root = path.resolve(__dirname, '..');
@@ -64,6 +65,8 @@ function isWindowVisible() {
   if (isMac && typeof macNative?.isVisible === 'function') return macNative.isVisible(window.getNativeWindowHandle());
   return window.isVisible();
 }
+let macCompactLayout = null, macCompactReady = false, macGeometrySerial = 0, lastMacGeometry = '';
+const macHostKey = host => String(host?.hostPid || '') + ':' + String(host?.window || '');
 let recoveryAttempts = 0, recoveryTimer = null, readyTimer = null;
 const visibilityHistory = [];
 let diagnosticShortcutRegistered = false, lastDiagnosticReport = null;
@@ -174,7 +177,7 @@ function setTestCursor(point) { if (fixture) { testCursor = point; sendCursor(tr
 const visibilityController = createVisibilityController({
   getWindow: () => window,
   isVisible: isWindowVisible,
-  getState: () => ({ ready: rendererReady && !modePending && (!usesWindowShape || !!windowShape) && (!usesSurfaceGuard || surfaceGuard.ready()) && (!isMac || fixture || desktopMode === 'standalone' || macFollower?.snapshot().bound), host: lastHost, standalone: desktopMode === 'standalone', fixture, manuallyHidden, quitting }),
+  getState: () => ({ ready: rendererReady && !modePending && (!usesWindowShape || !!windowShape) && (!usesSurfaceGuard || surfaceGuard.ready()) && (!isMac || fixture || desktopMode === 'standalone' || (macFollower?.snapshot().bound && macCompactReady)), host: lastHost, standalone: desktopMode === 'standalone', fixture, manuallyHidden, quitting }),
   onShown: () => {
     if (startup.phases.interactive == null) {
       markStartup('interactive');
@@ -184,6 +187,17 @@ const visibilityController = createVisibilityController({
 });
 function visibility() {
   visibilityController.update();
+}
+function sendMacGeometry(force = false) {
+  if (!isMac || fixture || !window || window.isDestroyed() || !rendererReady) return;
+  const binding = macFollower?.snapshot();
+  const host = desktopMode === 'follow-codex' && lastHost?.attached && binding?.bound ? binding.hostBounds : null;
+  const overlay = host ? binding.overlayBounds : null;
+  const hostKey = host ? macHostKey(lastHost) : '';
+  const encoded = JSON.stringify({ host, overlay, hostKey });
+  if (!force && encoded === lastMacGeometry) return;
+  lastMacGeometry = encoded;
+  window.webContents.send('whale-host-geometry', host ? { host, overlay, hostKey, serial: ++macGeometrySerial } : null);
 }
 function show() {
   manuallyHidden = false;
@@ -326,23 +340,30 @@ else {
     const firstBounds = initialHost?.bounds;
     const hostArea = firstBounds && ['x','y','width','height'].every(k => Number.isFinite(firstBounds[k])) && firstBounds.width > 10 && firstBounds.height > 10
       ? toDipRect(firstBounds) : screen.getPrimaryDisplay().workArea;
-    const area = isMac && desktopMode === 'follow-codex' ? companionBounds(hostArea) : hostArea;
+    const area = isMac && desktopMode === 'follow-codex' ? compactBounds(hostArea, null) : hostArea;
     // WS_EX_TOOLWINDOW keeps the large transparent overlay out of Chromium's
     // native occlusion calculation even while its opaque pixels accept clicks.
     // Keep normal activation: Chromium's non-client handler consumes the first
     // mouse down (MA_NOACTIVATEANDEAT) when CanActivate/focusable is false.
     window = new BrowserWindow({ ...area, ...(isMac ? { acceptFirstMouse: true } : { type: 'toolbar' }), transparent: true, frame: false, thickFrame: false, resizable: false, maximizable: false, fullscreenable: false, backgroundColor: '#00000000', hasShadow: false, skipTaskbar: true, show: false, title: 'API 余额小鲸鱼', webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false, autoplayPolicy: 'no-user-gesture-required', additionalArguments: fixture ? ['--whale-render-test'] : [] } });
-    if (usesWindowShape) applyWindowShape(EMPTY_SHAPE);
-    // Establish the baseline before the first native foreground sample.
+    // Set the baseline before the Mac follower selects its foreground level.
     window.setAlwaysOnTop(desktopMode === 'standalone', 'floating');
+    if (usesWindowShape) applyWindowShape(EMPTY_SHAPE);
     if (isMac) {
       if (app.dock) app.dock.hide();
       window.setVisibleOnAllWorkspaces(desktopMode === 'standalone', { visibleOnFullScreen: true, skipTransformProcessType: true });
       if (!fixture) {
+        macNative = null;
         const bindingPath = read(path.join(dataDir, 'follow-config.json')).spaceBindingPath;
         try { if (typeof bindingPath === 'string' && path.isAbsolute(bindingPath)) macNative = require(bindingPath); } catch {}
         macFollower = createMacFollower({ window, native: macNative, isVisible: isWindowVisible, getMode: () => desktopMode, getHost: () => lastHost,
-          applyHost: host => { lastHost = host; if (host.attached) markStartup('attached'); visibility(); sendCursor(true); },
+          getOverlayBounds: (host, target) => compactBounds(host, macCompactLayout?.hostKey === macHostKey(target) ? macCompactLayout : null),
+          applyHost: host => {
+            if (!host.attached || macHostKey(lastHost) !== macHostKey(host)) { macCompactLayout = null; macCompactReady = false; }
+            lastHost = host;
+            if (host.attached) markStartup('attached');
+            sendMacGeometry(); visibility(); sendCursor(true);
+          },
           onError: reason => diagnose('mac-' + reason) });
         if (lastHost) macFollower.observe(lastHost);
         macFollowTimer = setInterval(() => macFollower.tick(), 16);
@@ -384,6 +405,7 @@ else {
     window.webContents.on('did-start-loading', () => {
       if(quitting || !window || window.isDestroyed())return;
       rendererReady = false; inputEnabled = false; clearTimeout(readyTimer); readyTimer = setTimeout(() => { if (!rendererReady) recoverRenderer('ready-timeout'); }, 15000);
+      if (isMac && !fixture && desktopMode === 'follow-codex') { macCompactLayout = null; macCompactReady = false; lastMacGeometry = ''; }
       if (usesSurfaceGuard) surfaceGuard.reset('renderer-loading');
       if (usesWindowShape) applyWindowShape(EMPTY_SHAPE);
       visibility();
@@ -416,12 +438,21 @@ else {
       try { fs.rmSync(path.join(dataDir, 'desktop-error.json'), { force: true }); } catch {}
       clearTimeout(readyTimer); readyTimer = null;
       clearTimeout(recoveryTimer); recoveryTimer = null;
-      rendererReady = true; diagnose('ready'); window.webContents.send('whale-desktop-mode', desktopMode); visibility(); flushCommands(); invalidate(); sendCursor(true);
+      rendererReady = true; diagnose('ready'); window.webContents.send('whale-desktop-mode', desktopMode); sendMacGeometry(true); visibility(); flushCommands(); invalidate(); sendCursor(true);
     });
     ipcMain.on('whale-interactive', (event, enabled) => {
       if (!acceptsWindowMessage(window,event,quitting) || (usesWindowShape && !windowShape) || (usesSurfaceGuard && !surfaceGuard.ready()) || typeof enabled !== 'boolean' || enabled === inputEnabled) return;
       inputEnabled = enabled;
       window.setIgnoreMouseEvents(!enabled, { forward: !usesWindowShape });
+    });
+    ipcMain.on('whale-compact-layout', (event, layout) => {
+      if (!isMac || fixture || desktopMode !== 'follow-codex' || !isMainFrame(event) || !validLayout(layout)
+          || layout.serial !== macGeometrySerial || layout.hostKey !== macHostKey(lastHost)) return;
+      const previousSerial = macGeometrySerial;
+      macCompactLayout = layout;
+      macFollower?.tick();
+      if (macGeometrySerial === previousSerial) macCompactReady = true;
+      visibility();
     });
     ipcMain.on('whale-keyboard-focus', (event, editing) => {
       if (acceptsWindowMessage(window,event,quitting) && typeof editing === 'boolean') setKeyboardFocus(editing);
@@ -516,8 +547,10 @@ function setMode(mode) {
   appliedBounds = ''; appliedNativeSize = '';
   if (isMac) {
     window.hide();
+    macCompactLayout = null; macCompactReady = false; lastMacGeometry = '';
     window.setVisibleOnAllWorkspaces(mode === 'standalone', { visibleOnFullScreen: true, skipTransformProcessType: true });
     macFollower?.reset();
+    if (mode === 'standalone') window.webContents.send('whale-host-geometry', null);
   }
   if (!isMac && !fixture) {
     // Native ownership must finish changing before Electron changes geometry.
