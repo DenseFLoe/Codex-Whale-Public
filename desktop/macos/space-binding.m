@@ -120,6 +120,15 @@ static napi_value isVisible(napi_env env, napi_callback_info context) {
     }
 }
 
+static napi_value mouseButtons(napi_env env, napi_callback_info context) {
+    (void)context;
+    napi_value result = NULL;
+    // This public AppKit snapshot sees releases delivered to another app.
+    // Ignored-window mouse forwarding does not deliver a matching pointerup.
+    if (napi_create_uint32(env, (uint32_t)[NSEvent pressedMouseButtons], &result) != 0) return NULL;
+    return result;
+}
+
 static NSDictionary *syncWindow(NSWindow *overlay, uint32_t host, pid_t expectedPID) {
     if (!loadAPI()) return @{ @"ok": @NO, @"reason": @"skylight-unavailable" };
     int connection = mainConnection();
@@ -247,5 +256,7 @@ __attribute__((visibility("default"))) napi_value napi_register_module_v1(napi_e
         || napi_set_named_property(env, exports, "sync", function) != 0) return NULL;
     if (napi_create_function(env, "isVisible", 9, isVisible, NULL, &function) != 0
         || napi_set_named_property(env, exports, "isVisible", function) != 0) return NULL;
+    if (napi_create_function(env, "mouseButtons", 12, mouseButtons, NULL, &function) != 0
+        || napi_set_named_property(env, exports, "mouseButtons", function) != 0) return NULL;
     return exports;
 }

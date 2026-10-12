@@ -24,6 +24,10 @@ const markStartup = phase => { if (startup.phases[phase] == null) startup.phases
 markStartup('main');
 const isMac = process.platform === 'darwin';
 const usesWindowShape = process.platform === 'win32';
+// Ignored-window forwarding can report a press without its release on Mac.
+// Use the native cursor/button stream for transparent-area hit testing.
+const forwardsMouseMoves = !usesWindowShape && !isMac;
+const cursorPollMs = usesWindowShape || isMac ? 16 : 50;
 const usesSurfaceGuard = usesWindowShape && (!fixture || process.env.WHALE_NATIVE_SURFACE_GUARD === '1');
 let windowShape = null, windowShapeError = null;
 const toDipRect = rect => isMac ? rect : screen.screenToDipRect(null, rect);
@@ -86,6 +90,7 @@ const uiStore = new UiStateStore(stateFile);
 const values = () => uiStore.get();
 const storeValues = input => uiStore.set(input);
 let gpuStatus = null, inputEnabled = false, keyboardFocus = false, testCursor = null, lastCursor = '', presents = 0;
+let rendererInputState = null;
 let surfacePacket = null, surfaceFlushScheduled = false, surfaceLastReport = '', deferredShape = null;
 function publishSurface(packet) {
   if (!usesSurfaceGuard || !packet) return;
@@ -154,7 +159,7 @@ function applyWindowShape(rects) {
     if (usesSurfaceGuard) surfaceGuard.fail('shape-apply-failed');
     // Keep the last successful region. If even the initial shape failed, stay
     // hidden instead of exposing a full-client-area surface or reload looping.
-    if (!windowShape) { inputEnabled = false; window.setIgnoreMouseEvents(true, { forward: !usesWindowShape }); window.hide(); }
+    if (!windowShape) { inputEnabled = false; window.setIgnoreMouseEvents(true, { forward: forwardsMouseMoves }); window.hide(); }
     return false;
   }
 }
@@ -166,9 +171,13 @@ function setKeyboardFocus(editing) {
 function sendCursor(force = false) {
   if (!window || window.isDestroyed() || !rendererReady || !isWindowVisible()) return;
   const bounds = window.getContentBounds(), cursor = screen.getCursorScreenPoint();
-  const point = { ...(fixture && testCursor ? testCursor : { x: cursor.x - bounds.x, y: cursor.y - bounds.y }), buttons: lastHost?.mouseButtons || 0, sampledAt: lastHost?.mouseSampleAt || 0 };
+  const nativeButtons = isMac && typeof macNative?.mouseButtons === 'function' ? macNative.mouseButtons() : null;
+  const point = { ...(fixture && testCursor ? testCursor : { x: cursor.x - bounds.x, y: cursor.y - bounds.y }),
+    buttons: nativeButtons ?? (lastHost?.mouseButtons || 0), sampledAt: nativeButtons !== null ? Date.now() : lastHost?.mouseSampleAt || 0 };
   const encoded = point.x + ',' + point.y + ',' + point.buttons;
-  if (force || encoded !== lastCursor) { lastCursor = encoded; window.webContents.send('whale-cursor', point); }
+  // Send fresh Mac button evidence even at a stationary cursor: a release in
+  // another app must clear externalDrag without requiring movement or a swipe.
+  if (force || nativeButtons !== null || encoded !== lastCursor) { lastCursor = encoded; window.webContents.send('whale-cursor', point); }
 }
 function setTestCursor(point) { if (fixture) { testCursor = point; sendCursor(true); } }
 const visibilityController = createVisibilityController({
@@ -314,7 +323,7 @@ else {
     const { startBridge } = await import(pathToFileURL(path.join(root, 'runtime', 'bridge.mjs')));
     let testOptions = {};
     if (fixture) { const { makeFixture } = await import(pathToFileURL(path.join(root, 'tests', process.env.WHALE_CONNECTIONS_UI_TEST === '1' ? 'connection-ui-fixture.mjs' : 'desktop-fixture.mjs'))); testOptions = await makeFixture(dataDir); }
-    dispatcher = createDispatcher({ dataDir, fetchImpl: (url, options) => net.fetch(url, options), onStop: pauseAndQuit, onShow: show, statusInfo: () => ({ followCodex: desktopMode !== 'standalone', desktopMode, rendererReady, recoveryAttempts, manuallyHidden, platform: process.platform, followMode: lastHost?.followMode || null, hostPid: lastHost?.hostPid || null, visible: isWindowVisible(), modePending, windowShape, windowShapeError, windowBounds: window?.getBounds(), visibility: visibilityController.snapshot(), nativeFollowing: !!lastHost?.nativeFollowing, macSpaceBinding: macFollower?.snapshot() || null, mouseRouting: { forwardedMouseMoves: !usesWindowShape, cursorPollMs: usesWindowShape ? 16 : 50 }, diagnostics: { shortcutRegistered: diagnosticShortcutRegistered, lastReport: lastDiagnosticReport, native: lastHost?.visualDiagnostics || null }, startup, rendering: gpuStatus, surfaceGuard: usesSurfaceGuard ? surfaceGuard.snapshot() : null }), ...testOptions });
+    dispatcher = createDispatcher({ dataDir, fetchImpl: (url, options) => net.fetch(url, options), onStop: pauseAndQuit, onShow: show, statusInfo: () => ({ followCodex: desktopMode !== 'standalone', desktopMode, rendererReady, recoveryAttempts, manuallyHidden, platform: process.platform, followMode: lastHost?.followMode || null, hostPid: lastHost?.hostPid || null, visible: isWindowVisible(), modePending, windowShape, windowShapeError, windowBounds: window?.getBounds(), visibility: visibilityController.snapshot(), nativeFollowing: !!lastHost?.nativeFollowing, macSpaceBinding: macFollower?.snapshot() || null, mouseRouting: { inputEnabled, keyboardFocus, renderer: rendererInputState, forwardedMouseMoves: forwardsMouseMoves, cursorPollMs }, diagnostics: { shortcutRegistered: diagnosticShortcutRegistered, lastReport: lastDiagnosticReport, native: lastHost?.visualDiagnostics || null }, startup, rendering: gpuStatus, surfaceGuard: usesSurfaceGuard ? surfaceGuard.snapshot() : null }), ...testOptions });
     markStartup('dispatcherReady');
     await importLegacyStorage();
     session.defaultSession.protocol.handle('whale', async request => {
@@ -367,7 +376,7 @@ else {
     window.once('ready-to-show', () => markStartup('frameReady'));
     if (fixture) window.webContents.on('console-message', (_event, ...args) => { const d = args[0]; if (typeof d === 'object' ? d.level === 'error' : d === 3) rendererErrors.push(typeof d === 'object' ? d.message : args[1]); });
     if (!fixture || usesSurfaceGuard) process.stdout.write(JSON.stringify({ overlayHandle: window.getNativeWindowHandle().readBigUInt64LE().toString() }) + '\n');
-    window.setIgnoreMouseEvents(true, { forward: !usesWindowShape });
+    window.setIgnoreMouseEvents(true, { forward: forwardsMouseMoves });
     window.on('show', () => {
       // A recovered owned HWND can have a 40ms delayed show. Keep the verified
       // request stable through that delay, then resume the coalesced animation.
@@ -388,7 +397,7 @@ else {
       if (usesWindowShape) applyWindowShape(EMPTY_SHAPE);
       visibility();
       setKeyboardFocus(false);
-      window.setIgnoreMouseEvents(true, { forward: !usesWindowShape });
+      window.setIgnoreMouseEvents(true, { forward: forwardsMouseMoves });
     });
     window.webContents.setWindowOpenHandler(({ url }) => { openWebLink(url).catch(() => {}); return { action: 'deny' }; });
     window.webContents.on('will-navigate', (event, url) => { if (!url.startsWith(UI_ORIGIN + '/')) event.preventDefault(); });
@@ -418,17 +427,23 @@ else {
       clearTimeout(recoveryTimer); recoveryTimer = null;
       rendererReady = true; diagnose('ready'); window.webContents.send('whale-desktop-mode', desktopMode); visibility(); flushCommands(); invalidate(); sendCursor(true);
     });
+    ipcMain.on('whale-input-state', (event, state) => {
+      if (acceptsWindowMessage(window,event,quitting) && state && typeof state === 'object') {
+        rendererInputState = Object.fromEntries(['held', 'externalDrag', 'hit', 'hidden']
+          .filter(key => typeof state[key] === 'boolean').map(key => [key, state[key]]));
+      }
+    });
     ipcMain.on('whale-interactive', (event, enabled) => {
       if (!acceptsWindowMessage(window,event,quitting) || (usesWindowShape && !windowShape) || (usesSurfaceGuard && !surfaceGuard.ready()) || typeof enabled !== 'boolean' || enabled === inputEnabled) return;
       inputEnabled = enabled;
-      window.setIgnoreMouseEvents(!enabled, { forward: !usesWindowShape });
+      window.setIgnoreMouseEvents(!enabled, { forward: forwardsMouseMoves });
     });
     ipcMain.on('whale-keyboard-focus', (event, editing) => {
       if (acceptsWindowMessage(window,event,quitting) && typeof editing === 'boolean') setKeyboardFocus(editing);
     });
-    // Windows uses the native cursor sampler instead of forwarding ignored mouse
-    // messages into Chromium, which must not arbitrate the host cursor.
-    const cursorPoll = setInterval(sendCursor, usesWindowShape ? 16 : 50);
+    // Windows and Mac sample native input instead of forwarding ignored mouse
+    // messages, which can conflict with the host cursor or omit releases.
+    const cursorPoll = setInterval(sendCursor, cursorPollMs);
     const surfacePoll = usesSurfaceGuard ? setInterval(() => surfaceGuard.tick(), 100) : null;
     app.once('will-quit', () => { clearInterval(surfacePoll); surfaceGuard.dispose(); });
     app.once('will-quit', () => clearInterval(cursorPoll));

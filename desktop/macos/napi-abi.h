@@ -14,6 +14,7 @@ extern int napi_get_cb_info(napi_env, napi_callback_info, size_t *, napi_value *
 extern int napi_get_value_uint32(napi_env, napi_value, uint32_t *);
 extern int napi_get_buffer_info(napi_env, napi_value, void **, size_t *);
 extern int napi_get_boolean(napi_env, bool, napi_value *);
+extern int napi_create_uint32(napi_env, uint32_t, napi_value *);
 extern int napi_create_string_utf8(napi_env, const char *, size_t, napi_value *);
 extern int napi_create_function(napi_env, const char *, size_t, napi_callback, void *, napi_value *);
 extern int napi_set_named_property(napi_env, napi_value, const char *, napi_value);
