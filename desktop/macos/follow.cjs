@@ -12,9 +12,10 @@ function companionBounds(bounds) {
     width: Math.max(1, Math.round(bounds.width) - 1), height: Math.round(bounds.height) };
 }
 
-function createMacFollower({ window, native, getMode, applyHost, getHost, onError = () => {}, now = Date.now }) {
+function createMacFollower({ window, native, getMode, applyHost, getHost, isVisible = () => window.isVisible(), onError = () => {}, now = Date.now }) {
   let latest = null, attached = null, lastAt = 0, lastBounds = '', lastError = '';
   let uncertainSince = null, lastOrderingError = '';
+  let foregroundLevel = null;
   let disposed = false, inTick = false;
   const status = { mode: 'macos-space-bound', bound: false, animating: false, reason: null, spaces: [] };
   const identity = host => String(host?.hostPid || '') + ':' + String(host?.window || '');
@@ -71,7 +72,7 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
       const hostRect = Object.fromEntries(Object.entries(bounds).map(([key, value]) => [key, Math.round(value)]));
       const rect = companionBounds(bounds);
       const key = JSON.stringify(rect);
-      if (identity(attached) !== identity(target) && window.isVisible()) window.hide();
+      if (identity(attached) !== identity(target) && isVisible()) window.hide();
       if (key !== lastBounds) { window.setBounds(rect, false); lastBounds = key; }
       attached = { ...target, hostAlive: true, visible: !!sample.visible, attached: true,
         nativeFollowing: false, followMode: status.mode, bounds: hostRect };
@@ -82,10 +83,29 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
       // Ignore the probe's on-screen flag. Membership itself prevents painting
       // on another Space; hiding here would make the return animation pop in.
       applyHost(attached);
+      // A normal-level Codex window can cover its companion for one frame on
+      // every activation, before moveAbove repairs the order. Hold one extra
+      // level while this exact host is foreground, including widget editing.
+      // Restore normal ordering when another app/window comes forward. Do not
+      // change levels during Space animations or without a verified binding.
+      let lowered = false;
+      if (typeof sample.hostForeground === 'boolean') {
+        const raised = attached.visible && isVisible() && sample.hostForeground;
+        if (foregroundLevel !== raised) {
+          lowered = foregroundLevel === true && !raised;
+          window.setAlwaysOnTop(raised, 'normal', raised ? 1 : 0);
+          foregroundLevel = raised;
+        }
+        status.foregroundLevel = raised;
+      }
       // showInactive/focus and host activation can reorder normal-level
       // windows. Stay immediately above the verified host, below windows
       // covering it. Never order a hidden companion in or disturb a Space swipe.
-      if (attached.visible && window.isVisible()) {
+      // A settled native order is a no-op. In particular, do not repeatedly
+      // reorder an inactive window after a settings-card blur or Space return.
+      // Missing ordering is supported for older native modules until reinstall.
+      if (!foregroundLevel && attached.visible && isVisible() &&
+          (sample.ordering == null || sample.ordering === 'misplaced' || lowered && sample.ordering === 'above')) {
         try {
           window.moveAbove(`window:${hostWindow}:0`);
           lastOrderingError = ''; delete status.orderingError;
@@ -102,6 +122,7 @@ function createMacFollower({ window, native, getMode, applyHost, getHost, onErro
   }
   function observe(host) { latest = host; lastAt = now(); tick(); }
   function reset() {
+    foregroundLevel = null; delete status.foregroundLevel;
     attached = null; lastBounds = ''; status.bound = false; status.animating = false; status.spaces = []; status.reason = null;
     uncertainSince = null; lastOrderingError = ''; lastError = '';
     delete status.transientReason; delete status.orderingError;

@@ -63,6 +63,63 @@ static bool sameSpaces(NSArray *a, NSArray *b) {
     return a && b && a.count > 0 && [[NSSet setWithArray:a] isEqualToSet:[NSSet setWithArray:b]];
 }
 
+static NSDictionary *stackingState(uint32_t overlay, uint32_t host, pid_t hostPID) {
+    // Query actual stacking before ordering. Reissuing orderWindow every frame
+    // also re-enters AppKit/Chromium's visibility and focus handling while the
+    // app is inactive. Normal-level windows between us and the host matter;
+    // menu bar/floating windows should continue covering both.
+    CFArrayRef raw = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!raw) return @{ @"ordering": @"unknown", @"hostForeground": @NO };
+    NSArray *windows = CFBridgingRelease(raw);
+    NSInteger position = 0, ownIndex = -1, hostIndex = -1;
+    uint32_t firstNormal = 0;
+    for (NSDictionary *info in windows) {
+        uint32_t number = [info[(__bridge NSString *)kCGWindowNumber] unsignedIntValue];
+        NSInteger level = [info[(__bridge NSString *)kCGWindowLayer] integerValue];
+        // Include our temporarily raised window when checking relative order.
+        // Foreign floating panels keep their own level and are not reordered.
+        if (level != NSNormalWindowLevel && number != overlay) continue;
+        if (number != overlay && firstNormal == 0) firstNormal = number;
+        if (number == overlay) ownIndex = position;
+        if (number == host) hostIndex = position;
+        position++;
+    }
+    // Inactive Spaces are not on screen; leave their existing ordering alone.
+    pid_t activePID = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier;
+    // Keep the level stable while focus moves between the widget and Codex.
+    // Another Codex window (including a dialog) must not inherit this privilege.
+    bool foreground = hostIndex >= 0 && firstNormal == host
+        && (activePID == hostPID || activePID == NSProcessInfo.processInfo.processIdentifier);
+    NSString *order = ownIndex < 0 || hostIndex < 0 ? @"offscreen"
+        : ownIndex + 1 == hostIndex ? @"above" : @"misplaced";
+    return @{ @"ordering": order, @"hostForeground": @(foreground) };
+}
+
+// Electron's isVisible() includes occlusion on macOS (and 44.3.0 inverts the
+// visible occlusion bit). Neither occlusion nor focus means orderOut. Read the
+// owned AppKit window directly for lifecycle, relative ordering and input.
+static napi_value isVisible(napi_env env, napi_callback_info context) {
+    @autoreleasepool {
+        size_t count = 1, length = 0;
+        napi_value argument, result = NULL;
+        void *bytes = NULL;
+        bool visible = false;
+        if ([NSThread isMainThread] && napi_get_cb_info(env, context, &count, &argument, NULL, NULL) == 0 && count == 1
+            && napi_get_buffer_info(env, argument, &bytes, &length) == 0 && length == sizeof(void *)) {
+            uintptr_t view = 0;
+            memcpy(&view, bytes, sizeof(view));
+            for (NSWindow *candidate in NSApp.windows) {
+                if ((uintptr_t)(__bridge void *)candidate.contentView == view) {
+                    visible = candidate.visible && !candidate.miniaturized;
+                    break;
+                }
+            }
+        }
+        if (napi_get_boolean(env, visible, &result) != 0) return NULL;
+        return result;
+    }
+}
+
 static NSDictionary *syncWindow(NSWindow *overlay, uint32_t host, pid_t expectedPID) {
     if (!loadAPI()) return @{ @"ok": @NO, @"reason": @"skylight-unavailable" };
     int connection = mainConnection();
@@ -138,10 +195,16 @@ static NSDictionary *syncWindow(NSWindow *overlay, uint32_t host, pid_t expected
 
     // CG/SkyLight coordinates are logical points, including on Retina displays.
     // They are model bounds, not the in-flight Space animation's screen offset.
+    NSDictionary *stacking = stackingState(ownWindow, host, expectedPID);
     return @{
         @"ok": @YES, @"animating": @NO, @"bound": @YES,
         @"visible": @(orderedIn && !application.hidden),
         @"hostWindow": @(host), @"overlayWindow": @(ownWindow),
+        @"ordering": stacking[@"ordering"], @"hostForeground": stacking[@"hostForeground"],
+        @"overlayLevel": @(overlay.level),
+        @"overlayVisible": @(overlay.visible), @"overlayOnActiveSpace": @(overlay.onActiveSpace),
+        @"overlayKey": @(overlay.keyWindow), @"overlayIgnoresMouse": @(overlay.ignoresMouseEvents),
+        @"overlayOccluded": @(!(overlay.occlusionState & NSWindowOcclusionStateVisible)),
         @"spaces": [targetSpaces valueForKey:@"stringValue"],
         @"bounds": @{ @"x": @(bounds.origin.x), @"y": @(bounds.origin.y),
             @"width": @(bounds.size.width), @"height": @(bounds.size.height) }
@@ -182,5 +245,7 @@ __attribute__((visibility("default"))) napi_value napi_register_module_v1(napi_e
     napi_value function;
     if (napi_create_function(env, "sync", 4, syncBinding, NULL, &function) != 0
         || napi_set_named_property(env, exports, "sync", function) != 0) return NULL;
+    if (napi_create_function(env, "isVisible", 9, isVisible, NULL, &function) != 0
+        || napi_set_named_property(env, exports, "isVisible", function) != 0) return NULL;
     return exports;
 }

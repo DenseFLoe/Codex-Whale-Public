@@ -58,13 +58,19 @@ const save = (file, value) => { const temp = file + '.' + process.pid + '.tmp'; 
 let desktopMode = read(path.join(dataDir, 'follow-config.json')).mode === 'standalone' ? 'standalone' : 'follow-codex';
 let desktopBoundsApplied = false, modePending = false;
 let macFollower = null, macFollowTimer = null;
+let macNative = null;
+function isWindowVisible() {
+  if (!window || window.isDestroyed()) return false;
+  if (isMac && typeof macNative?.isVisible === 'function') return macNative.isVisible(window.getNativeWindowHandle());
+  return window.isVisible();
+}
 let recoveryAttempts = 0, recoveryTimer = null, readyTimer = null;
 const visibilityHistory = [];
 let diagnosticShortcutRegistered = false, lastDiagnosticReport = null;
 const visibilityRecorder = createVisibilityRecorder({
   read: () => {
     if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return null;
-    return { ready: rendererReady, visible: window.isVisible(), manuallyHidden, desktopMode,
+    return { ready: rendererReady, visible: isWindowVisible(), manuallyHidden, desktopMode,
       hostAlive: !!lastHost?.hostAlive, hostVisible: !!lastHost?.visible, modal: !!lastHost?.modal,
       native: lastHost?.visualDiagnostics || null, bounds: window.getBounds(),
       shape: windowShape, shapeError: !!windowShapeError, inputEnabled,
@@ -113,7 +119,7 @@ const surfaceGuard = createSurfaceGuard({
   restored: () => {
     if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
     surfaceLastReport = '';
-    if (deferredShape && window.isVisible()) { const latest = deferredShape; deferredShape = null; applyWindowShape(latest); }
+    if (deferredShape && isWindowVisible()) { const latest = deferredShape; deferredShape = null; applyWindowShape(latest); }
     window.webContents.send('whale-input-reset'); sendCursor(true);
   },
   changed: () => { if (usesSurfaceGuard && window && !window.isDestroyed()) visibility(); },
@@ -158,7 +164,7 @@ function setKeyboardFocus(editing) {
   if (editing) window.focus();
 }
 function sendCursor(force = false) {
-  if (!window || window.isDestroyed() || !rendererReady || !window.isVisible()) return;
+  if (!window || window.isDestroyed() || !rendererReady || !isWindowVisible()) return;
   const bounds = window.getContentBounds(), cursor = screen.getCursorScreenPoint();
   const point = { ...(fixture && testCursor ? testCursor : { x: cursor.x - bounds.x, y: cursor.y - bounds.y }), buttons: lastHost?.mouseButtons || 0, sampledAt: lastHost?.mouseSampleAt || 0 };
   const encoded = point.x + ',' + point.y + ',' + point.buttons;
@@ -167,6 +173,7 @@ function sendCursor(force = false) {
 function setTestCursor(point) { if (fixture) { testCursor = point; sendCursor(true); } }
 const visibilityController = createVisibilityController({
   getWindow: () => window,
+  isVisible: isWindowVisible,
   getState: () => ({ ready: rendererReady && !modePending && (!usesWindowShape || !!windowShape) && (!usesSurfaceGuard || surfaceGuard.ready()) && (!isMac || fixture || desktopMode === 'standalone' || macFollower?.snapshot().bound), host: lastHost, standalone: desktopMode === 'standalone', fixture, manuallyHidden, quitting }),
   onShown: () => {
     if (startup.phases.interactive == null) {
@@ -206,7 +213,7 @@ async function showStatusDialog() {
     '平台：' + process.platform,
     '跟随模式：' + (lastHost?.followMode || (lastHost?.nativeFollowing ? 'native' : '等待 Codex')),
     'Codex PID：' + (lastHost?.hostPid || '未检测到'),
-    '挂件窗口：' + (window?.isVisible?.() ? '显示' : '隐藏'),
+    '挂件窗口：' + (isWindowVisible() ? '显示' : '隐藏'),
     '桌面模式：' + desktopMode,
     '素材就绪：' + rendererReady,
     '恢复次数：' + recoveryAttempts,
@@ -307,7 +314,7 @@ else {
     const { startBridge } = await import(pathToFileURL(path.join(root, 'runtime', 'bridge.mjs')));
     let testOptions = {};
     if (fixture) { const { makeFixture } = await import(pathToFileURL(path.join(root, 'tests', process.env.WHALE_CONNECTIONS_UI_TEST === '1' ? 'connection-ui-fixture.mjs' : 'desktop-fixture.mjs'))); testOptions = await makeFixture(dataDir); }
-    dispatcher = createDispatcher({ dataDir, fetchImpl: (url, options) => net.fetch(url, options), onStop: pauseAndQuit, onShow: show, statusInfo: () => ({ followCodex: desktopMode !== 'standalone', desktopMode, rendererReady, recoveryAttempts, manuallyHidden, platform: process.platform, followMode: lastHost?.followMode || null, hostPid: lastHost?.hostPid || null, visible: !!window?.isVisible(), modePending, windowShape, windowShapeError, windowBounds: window?.getBounds(), visibility: visibilityController.snapshot(), nativeFollowing: !!lastHost?.nativeFollowing, macSpaceBinding: macFollower?.snapshot() || null, mouseRouting: { forwardedMouseMoves: !usesWindowShape, cursorPollMs: usesWindowShape ? 16 : 50 }, diagnostics: { shortcutRegistered: diagnosticShortcutRegistered, lastReport: lastDiagnosticReport, native: lastHost?.visualDiagnostics || null }, startup, rendering: gpuStatus, surfaceGuard: usesSurfaceGuard ? surfaceGuard.snapshot() : null }), ...testOptions });
+    dispatcher = createDispatcher({ dataDir, fetchImpl: (url, options) => net.fetch(url, options), onStop: pauseAndQuit, onShow: show, statusInfo: () => ({ followCodex: desktopMode !== 'standalone', desktopMode, rendererReady, recoveryAttempts, manuallyHidden, platform: process.platform, followMode: lastHost?.followMode || null, hostPid: lastHost?.hostPid || null, visible: isWindowVisible(), modePending, windowShape, windowShapeError, windowBounds: window?.getBounds(), visibility: visibilityController.snapshot(), nativeFollowing: !!lastHost?.nativeFollowing, macSpaceBinding: macFollower?.snapshot() || null, mouseRouting: { forwardedMouseMoves: !usesWindowShape, cursorPollMs: usesWindowShape ? 16 : 50 }, diagnostics: { shortcutRegistered: diagnosticShortcutRegistered, lastReport: lastDiagnosticReport, native: lastHost?.visualDiagnostics || null }, startup, rendering: gpuStatus, surfaceGuard: usesSurfaceGuard ? surfaceGuard.snapshot() : null }), ...testOptions });
     markStartup('dispatcherReady');
     await importLegacyStorage();
     session.defaultSession.protocol.handle('whale', async request => {
@@ -326,23 +333,21 @@ else {
     // mouse down (MA_NOACTIVATEANDEAT) when CanActivate/focusable is false.
     window = new BrowserWindow({ ...area, ...(isMac ? { acceptFirstMouse: true } : { type: 'toolbar' }), transparent: true, frame: false, thickFrame: false, resizable: false, maximizable: false, fullscreenable: false, backgroundColor: '#00000000', hasShadow: false, skipTaskbar: true, show: false, title: 'API 余额小鲸鱼', webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false, autoplayPolicy: 'no-user-gesture-required', additionalArguments: fixture ? ['--whale-render-test'] : [] } });
     if (usesWindowShape) applyWindowShape(EMPTY_SHAPE);
+    // Establish the baseline before the first native foreground sample.
+    window.setAlwaysOnTop(desktopMode === 'standalone', 'floating');
     if (isMac) {
       if (app.dock) app.dock.hide();
       window.setVisibleOnAllWorkspaces(desktopMode === 'standalone', { visibleOnFullScreen: true, skipTransformProcessType: true });
       if (!fixture) {
-        let native = null;
         const bindingPath = read(path.join(dataDir, 'follow-config.json')).spaceBindingPath;
-        try { if (typeof bindingPath === 'string' && path.isAbsolute(bindingPath)) native = require(bindingPath); } catch {}
-        macFollower = createMacFollower({ window, native, getMode: () => desktopMode, getHost: () => lastHost,
+        try { if (typeof bindingPath === 'string' && path.isAbsolute(bindingPath)) macNative = require(bindingPath); } catch {}
+        macFollower = createMacFollower({ window, native: macNative, isVisible: isWindowVisible, getMode: () => desktopMode, getHost: () => lastHost,
           applyHost: host => { lastHost = host; if (host.attached) markStartup('attached'); visibility(); sendCursor(true); },
           onError: reason => diagnose('mac-' + reason) });
         if (lastHost) macFollower.observe(lastHost);
         macFollowTimer = setInterval(() => macFollower.tick(), 16);
       }
     }
-    // Follow windows share Codex's normal level; the macOS follower maintains
-    // relative ordering so another application's window can cover both.
-    window.setAlwaysOnTop(desktopMode === 'standalone', 'floating');
     if (desktopMode === 'standalone') window.setBounds(screen.getPrimaryDisplay().workArea);
     window.webContents.on('render-process-gone', (_event, details) => { rendererReady = false; if (usesSurfaceGuard) surfaceGuard.fail('renderer-gone'); visibility(); recoverRenderer('renderer-' + details.reason); });
     window.on('unresponsive', () => {

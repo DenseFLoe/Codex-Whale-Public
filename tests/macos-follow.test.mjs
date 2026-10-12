@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 
 const { createMacFollower } = createRequire(import.meta.url)('../desktop/macos/follow.cjs');
 
-function fixture() {
+function fixture({ nativeVisibility = false } = {}) {
   const calls = [];
   let time = 0, mode = 'follow-codex', visible = false, manuallyHidden = false, orderFails = false;
   let sample = { ok: true, bound: true, visible: true, hostWindow: 123, overlayWindow: 789,
@@ -15,9 +15,11 @@ function fixture() {
     getNativeWindowHandle: () => Buffer.alloc(8),
     hide() { visible = false; calls.push(['hide']); },
     setBounds(bounds) { calls.push(['bounds', bounds]); },
-    moveAbove(id) { calls.push(['above', id]); if (orderFails) throw new Error('window gone'); }
+    moveAbove(id) { calls.push(['above', id]); if (orderFails) throw new Error('window gone'); },
+    setAlwaysOnTop(raised, level, relativeLevel) { calls.push(['level', raised, level, relativeLevel]); }
   };
   const follower = createMacFollower({ window, getMode: () => mode, getHost: () => host, now: () => time,
+    ...(nativeVisibility ? { isVisible: () => visible } : {}),
     native: { sync() { calls.push(['sync']); return JSON.stringify(sample); } },
     applyHost(value) { calls.push(['apply', value]); visible = !!value.visible && !manuallyHidden; },
     onError(reason) { calls.push(['error', reason]); }
@@ -26,6 +28,39 @@ function fixture() {
     setTime: value => { time = value; }, setMode: value => { mode = value; },
     setHidden: value => { manuallyHidden = value; }, setOrderFailure: value => { orderFails = value; } };
 }
+
+test('relative ordering uses native mapping even when Electron reports the visible companion hidden', () => {
+  const f = fixture({ nativeVisibility: true });
+  f.window.isVisible = () => false;
+  f.follower.observe(f.host);
+  assert.deepEqual(f.calls.at(-1), ['above', 'window:123:0']);
+  f.calls.length = 0;
+  f.patch({ hostWindow: 456 }); f.follower.observe({ ...f.host, window: '456' });
+  assert.deepEqual(f.calls.map(call => call[0]), ['sync', 'hide', 'apply', 'above']);
+  f.setHidden(true); f.calls.length = 0; f.follower.tick();
+  assert.equal(f.calls.some(call => call[0] === 'above'), false);
+});
+
+test('settled stacking is not rewritten after blur; a real order change repairs once', () => {
+  const f = fixture(); f.patch({ ordering: 'above' }); f.follower.observe(f.host);
+  f.calls.length = 0;
+  for (let i = 0; i < 1000; i++) f.follower.tick();
+  assert.equal(f.calls.some(call => call[0] === 'above' || call[0] === 'hide' || call[0] === 'bounds'), false);
+  f.patch({ ordering: 'misplaced' }); f.follower.tick();
+  assert.equal(f.calls.filter(call => call[0] === 'above').length, 1);
+  f.patch({ ordering: 'above' }); f.follower.tick();
+  assert.equal(f.calls.filter(call => call[0] === 'above').length, 1);
+});
+
+test('inactive Spaces and unavailable stacking snapshots never force an order', () => {
+  const f = fixture();
+  for (const ordering of ['offscreen', 'unknown']) {
+    f.patch({ ordering }); f.follower.observe(f.host);
+  }
+  assert.equal(f.calls.some(call => call[0] === 'above'), false);
+  assert.equal(f.follower.snapshot().bound, true);
+  assert.equal(f.window.isVisible(), true);
+});
 
 test('macOS follows directly above the verified host after showing, including unchanged bounds', () => {
   const f = fixture(); f.follower.observe(f.host);
@@ -142,4 +177,108 @@ test('ordering failure keeps a verified binding and retries without remapping', 
   assert.equal(f.follower.snapshot().orderingError, undefined);
   assert.equal(f.calls.some(call => call[0] === 'hide'), false);
   assert.deepEqual(f.calls.at(-1), ['above', 'window:123:0']);
+});
+
+const levelCalls = calls => calls.filter(call => call[0] === 'level');
+
+test('lowering re-establishes host adjacency even when the old raised snapshot said above', () => {
+  const f = fixture(); f.patch({ hostForeground: true, ordering: 'above' });
+  f.follower.observe(f.host); f.calls.length = 0;
+  f.patch({ hostForeground: false }); f.follower.tick();
+  assert.deepEqual(f.calls.filter(call => ['level', 'above'].includes(call[0])), [
+    ['level', false, 'normal', 0], ['above', 'window:123:0'],
+  ]);
+  f.calls.length = 0; f.follower.tick();
+  assert.equal(f.calls.some(call => ['level', 'above', 'hide'].includes(call[0])), false);
+});
+
+test('a manually hidden companion cannot acquire a foreground level or be reordered', () => {
+  const f = fixture(); f.setHidden(true); f.patch({ hostForeground: true, ordering: 'misplaced' });
+  f.follower.observe(f.host);
+  assert.equal(f.window.isVisible(), false);
+  assert.deepEqual(levelCalls(f.calls), [['level', false, 'normal', 0]]);
+  assert.equal(f.calls.some(call => call[0] === 'above'), false);
+  f.calls.length = 0; f.setHidden(false); f.follower.tick();
+  assert.deepEqual(levelCalls(f.calls), [['level', true, 'normal', 1]]);
+});
+
+test('an existing raised level stays untouched throughout a Space animation', () => {
+  const f = fixture(); f.patch({ hostForeground: true, ordering: 'above' }); f.follower.observe(f.host);
+  f.calls.length = 0; f.patch({ animating: true, hostForeground: false }); f.follower.tick();
+  assert.deepEqual(f.calls, [['sync']]);
+  assert.equal(f.follower.snapshot().foregroundLevel, true);
+});
+
+test('a foreground host raises one normal level once and steady ticks never repeat it', () => {
+  const f = fixture(); f.patch({ hostForeground: true, ordering: 'misplaced' });
+  f.follower.observe(f.host);
+  assert.deepEqual(f.calls.map(call => call[0]), ['sync', 'bounds', 'apply', 'level']);
+  assert.deepEqual(levelCalls(f.calls), [['level', true, 'normal', 1]]);
+  assert.equal(f.follower.snapshot().foregroundLevel, true);
+  f.calls.length = 0;
+  for (let i = 0; i < 1000; i++) f.follower.tick();
+  // A raised companion must not re-assert its level, re-order, hide or remap.
+  for (const kind of ['level', 'hide', 'bounds', 'above']) {
+    assert.equal(f.calls.filter(call => call[0] === kind).length, 0, 'steady foreground ticks must not repeat ' + kind);
+  }
+  assert.deepEqual([...new Set(f.calls.map(call => call[0]))].sort(), ['apply', 'sync']);
+  assert.equal(f.follower.snapshot().bound, true);
+  assert.equal(f.window.isVisible(), true);
+});
+
+test('a host leaving the foreground restores the normal level and still repairs a misplaced order once', () => {
+  const f = fixture(); f.patch({ hostForeground: true, ordering: 'misplaced' });
+  f.follower.observe(f.host); f.calls.length = 0;
+  f.patch({ hostForeground: false }); f.follower.tick();
+  assert.deepEqual(levelCalls(f.calls), [['level', false, 'normal', 0]]);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'above'), [['above', 'window:123:0']]);
+  assert.equal(f.follower.snapshot().foregroundLevel, false);
+  f.calls.length = 0; f.patch({ ordering: 'above' });
+  for (let i = 0; i < 100; i++) f.follower.tick();
+  assert.equal(levelCalls(f.calls).length, 0);
+  assert.equal(f.calls.some(call => call[0] === 'above'), false, 'a settled order is not rewritten after the level drops');
+});
+
+test('Space animation never touches the foreground level', () => {
+  const f = fixture(); f.follower.observe(f.host); f.calls.length = 0;
+  f.patch({ animating: true, hostForeground: true, bounds: { x: 600, y: 20, width: 480, height: 340 } });
+  f.follower.tick();
+  assert.deepEqual(f.calls, [['sync']]);
+  assert.equal(levelCalls(f.calls).length, 0);
+  assert.equal(f.follower.snapshot().foregroundLevel, undefined);
+});
+
+test('standalone mode never touches the foreground level', () => {
+  const f = fixture(); f.patch({ hostForeground: true }); f.setMode('standalone');
+  f.follower.observe(f.host); f.follower.tick();
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.follower.snapshot().foregroundLevel, undefined);
+});
+
+test('reset clears the cached foreground level so the next tick re-applies it exactly once', () => {
+  const f = fixture(); f.patch({ hostForeground: true, ordering: 'above' });
+  f.follower.observe(f.host);
+  assert.deepEqual(levelCalls(f.calls), [['level', true, 'normal', 1]]);
+  f.calls.length = 0; f.follower.reset();
+  assert.equal(f.follower.snapshot().foregroundLevel, undefined);
+  f.follower.tick();
+  assert.deepEqual(levelCalls(f.calls), [['level', true, 'normal', 1]]);
+  f.calls.length = 0;
+  for (let i = 0; i < 50; i++) f.follower.tick();
+  assert.equal(levelCalls(f.calls).length, 0);
+});
+
+test('an older native module without hostForeground keeps the existing ordering behavior', () => {
+  const f = fixture(); f.patch({ ordering: 'misplaced' });
+  f.follower.observe(f.host);
+  assert.equal('hostForeground' in f.follower.snapshot().native, false, 'the legacy probe snapshot carries no foreground flag');
+  assert.equal(levelCalls(f.calls).length, 0);
+  assert.deepEqual(f.calls.map(call => call[0]), ['sync', 'bounds', 'apply', 'above']);
+  assert.equal(f.follower.snapshot().foregroundLevel, undefined);
+  f.calls.length = 0; f.patch({ ordering: 'above' });
+  for (let i = 0; i < 100; i++) f.follower.tick();
+  assert.equal(levelCalls(f.calls).length, 0);
+  assert.equal(f.calls.some(call => call[0] === 'above'), false);
+  assert.equal(f.follower.snapshot().bound, true);
+  assert.equal(f.window.isVisible(), true);
 });
