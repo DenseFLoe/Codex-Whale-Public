@@ -21,8 +21,13 @@
     async function load(manual = false) {
       const own = ++generation; refresh.disabled = true; content.replaceChildren(); text(content, 'p', '正在读取…');
       try {
-        const response = await fetch('/api/insights' + (manual ? '?refresh=1' : ''), { cache: 'no-store' }); if (!response.ok) throw Error('暂时无法读取额度'); const data = await response.json();
-        if (data.ok === false || data.error) throw Error('刷新失败，请重试');
+        let data;
+        if (window.WhaleAccountView?.mode === 'subscription') data = await window.WhaleAccountView.refresh({ force: manual });
+        else {
+          const response = await fetch('/api/insights' + (manual ? '?refresh=1' : ''), { cache: 'no-store' });
+          if (!response.ok) throw Error('暂时无法读取额度'); data = await response.json();
+        }
+        if (!data || data.ok === false || data.error) throw Error('刷新失败，请重试');
         if (own !== generation || !dialog.isConnected) return;
         if (manual) window.whaleToast?.(window.WhaleAccountView?.mode === 'subscription' ? window.WhaleAccountView.refreshMessage(data) : '时段规则已刷新');
         content.replaceChildren(); const sub = data.subscription || {};

@@ -27,7 +27,7 @@ test('subscription failure consumption displays tokens without API money or fun 
 });
 function runtime(fetch) {
   const storage = new Map(); const events = [];
-  const context = { document: { documentElement: {dataset:{}}, readyState: 'loading', addEventListener() {}, querySelectorAll(){return []} }, window: { dispatchEvent(e) { events.push(e); } }, localStorage: { getItem(k) { return storage.get(k); }, setItem(k,v) { storage.set(k,v); } }, fetch, CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } } };
+  const context = { AbortController, setTimeout, clearTimeout, document: { documentElement: {dataset:{}}, readyState: 'loading', addEventListener() {}, querySelectorAll(){return []} }, window: { dispatchEvent(e) { events.push(e); } }, localStorage: { getItem(k) { return storage.get(k); }, setItem(k,v) { storage.set(k,v); } }, fetch, CustomEvent: class { constructor(type, options = {}) { this.type = type; this.detail = options.detail; } } };
   vm.runInNewContext(source, context);
   return { api: context.window.WhaleAccountView, storage, events, window:context.window };
 }

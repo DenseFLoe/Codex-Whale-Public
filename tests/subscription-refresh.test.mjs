@@ -52,9 +52,9 @@ test('account view requests forced scans and clears failed snapshots',async()=>{
   const {default:vm}=await import('node:vm');
   const source=fs.readFileSync(new URL('../desktop/ui/account-view.js',import.meta.url),'utf8');
   const calls=[];let fail=false;
-  const window={};
+  const window={dispatchEvent(){}};
   vm.runInNewContext(source,{window,document:{readyState:'loading',addEventListener(){}},
-    localStorage:{getItem:()=> 'subscription'},AbortController,setTimeout,clearTimeout,
+    localStorage:{getItem:()=> 'subscription'},AbortController,setTimeout,clearTimeout,CustomEvent:class {constructor(type){this.type=type;}},
     fetch:async url=>{calls.push(url);return {ok:!fail,json:async()=>({ok:true,subscription:{available:true,windows:[]}})};}});
   await window.WhaleAccountView.refresh();assert.equal(calls[0],'/api/insights');
   await window.WhaleAccountView.refresh({force:true});assert.equal(calls[1],'/api/insights?refresh=1');
